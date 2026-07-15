@@ -37,7 +37,7 @@ communicate through a small set of well-defined state variables:
 | 9 | SMT Divergence Engine | `smtBullValid` / `smtBearValid` | Scoring |
 | 10 | Scoring + Setup Engine | Graded signals, opens trades | Trade mgmt, alerts |
 | 11 | Trade Management Engine | SL/BE/TP tracking, win/loss stats | Dashboard, alerts |
-| 12 | Dashboard Engine | Right-side table (bias, checklist, stats) | — |
+| 12 | Dashboard Engine | Right-side table (bias, live funnel, checklist, stats) | — |
 | 13 | Alert Engine | 9 static alertconditions + JSON `alert()` calls | — |
 
 ### Setup state machine
@@ -82,8 +82,12 @@ communicate through a small set of well-defined state variables:
 1. Open TradingView → Pine Editor → paste `SMC_IFVG_Model.pine` → **Add to chart**.
 2. Trade in the direction of the dashboard **Market Bias** only (the engine already
    enforces this).
-3. Wait for a triangle signal. The label shows rating + Entry/SL/BE/TP1/TP2.
-4. Alerts: *Create Alert → Condition: SMC-IFVG* and pick a static condition
+3. Watch the **LIVE FUNNEL** section of the dashboard — it shows the state of the setup
+   currently being built (sweep → V-shape → IFVG armed) and a status line naming the leg
+   it is waiting on (`waiting: sweep`, `ARMED · awaiting retest`, `IN TRADE`, …). The
+   checklist below it describes the *last fired* setup, not the live one.
+4. Wait for a triangle signal. The label shows rating + Entry/SL/BE/TP1/TP2.
+5. Alerts: *Create Alert → Condition: SMC-IFVG* and pick a static condition
    (A/A+/A++ Setup, Long/Short Signal, TP/Stop Hit, Liquidity Sweep, IFVG Created), **or**
    choose *"Any alert() function call"* for the webhook JSON payload:
 
