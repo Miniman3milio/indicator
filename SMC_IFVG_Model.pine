@@ -1,0 +1,1025 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  SMC INVERSION FVG MODEL — Institutional Execution Assistant
+//  Original implementation of Smart Money Concepts (no proprietary code reused).
+//
+//  Pipeline:  Liquidity Sweep → Structure → V-Recovery → FVG → IFVG Retest
+//             → HTF Confluence → Premium/Discount → DOL → SMT → Score → Trade
+//
+//  Modules:
+//   1. Market Structure Engine      6. HTF Engine
+//   2. Liquidity Engine             7. Premium/Discount Engine
+//   3. FVG Engine                   8. Draw-On-Liquidity Engine
+//   4. IFVG Engine                  9. SMT Divergence Engine
+//   5. V-Shape Recovery Engine     10. Scoring / Trade Mgmt / Dashboard / Alerts
+//
+//  Non-repainting policy:
+//   • All state mutates on confirmed bars only (barstate.isconfirmed guard).
+//   • Every request.security() uses the [1]-offset + lookahead_on pattern,
+//     which returns the last FULLY CLOSED higher-timeframe bar (no lookahead).
+//   • Pivots confirm after `length` bars by definition (lag, never repaint).
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("SMC Inversion FVG Model [Institutional]", "SMC-IFVG",
+     overlay = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500)
+
+// ═════════════════════════════════════════════════════════════════ CONSTANTS
+int  BULL =  1
+int  BEAR = -1
+int  FLAT =  0
+
+// FVG states
+int FVG_ACTIVE    = 0
+int FVG_MITIGATED = 1
+int FVG_FILLED    = 2
+int FVG_INVERTED  = 3
+
+// ══════════════════════════════════════════════════════════════════ SETTINGS
+string G1  = "1 · Market Structure"
+string G2  = "2 · Liquidity"
+string G3  = "3 · Sessions"
+string G4  = "4 · Fair Value Gaps"
+string G5  = "5 · Inversion FVG"
+string G6  = "6 · V-Shape Recovery"
+string G7  = "7 · Higher Timeframes"
+string G8  = "8 · Premium / Discount"
+string G9  = "9 · Draw On Liquidity"
+string G10 = "10 · SMT Divergence"
+string G11 = "11 · Setup Engine"
+string G12 = "12 · Trade Management"
+string G13 = "13 · Dashboard"
+string G14 = "14 · Style"
+
+// — 1 · Market structure
+msSwingLen    = input.int (8,     "Swing Length",                 minval = 3,  maxval = 50, group = G1, tooltip = "Pivot width for the swing (external) structure. Confirms `length` bars after the extreme — lag, not repaint.")
+msIntLen      = input.int (3,     "Internal Structure Length",    minval = 2,  maxval = 20, group = G1, tooltip = "Pivot width for internal structure. Used for momentum confirmation inside the V-shape engine.")
+msHtfFilter   = input.bool(false, "Higher-TF Bias Filter",        group = G1,  tooltip = "Only trade when chart bias agrees with the HTF bias proxy (close vs EMA-50 on the filter TF).")
+msHtfFilterTf = input.timeframe("60", "Bias Filter Timeframe",    group = G1)
+showStructure = input.bool(true,  "Show BOS / CHoCH Labels",      group = G1)
+
+// — 2 · Liquidity
+liqEqAtr      = input.float(0.25, "Equal High/Low Tolerance (×ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G2, tooltip = "Two pivots closer than this are merged into one EQH/EQL pool.")
+liqCloseConf  = input.bool (false,"Close-Rejection Sweep Confirmation", group = G2, tooltip = "OFF (wick mode): high pokes the level and the bar closes back inside.\nON: additionally requires the rejection candle to close against the sweep (bearish close after a BSL raid, bullish after an SSL raid).")
+liqMaxLevels  = input.int  (12,   "Max Levels Per Side",          minval = 4, maxval = 30, group = G2)
+showLiq       = input.bool (true, "Show Liquidity Levels",        group = G2)
+
+// — 3 · Sessions
+sesShow   = input.bool   (true,            "Track Session Liquidity", group = G3)
+sesTz     = input.string ("America/New_York", "Timezone",             group = G3)
+sesAsia   = input.session("1800-0300",     "Asia",                    group = G3)
+sesLondon = input.session("0300-0830",     "London",                  group = G3)
+sesNy     = input.session("0930-1600",     "New York",                group = G3)
+
+// — 4 · FVG
+fvgMinAtr   = input.float(0.15, "Min Gap Size (×ATR)",  minval = 0.0, maxval = 3.0, step = 0.05, group = G4, tooltip = "Gaps smaller than this fraction of ATR(14) are noise and ignored.")
+fvgKeepHist = input.bool (false,"Keep Filled (Historical) Zones", group = G4)
+fvgMaxKeep  = input.int  (20,   "Max Tracked FVGs",     minval = 5, maxval = 60, group = G4)
+showFvg     = input.bool (true, "Show FVG Zones",       group = G4)
+
+// — 5 · IFVG
+ifvgCloseBreak = input.bool(true,  "Candle-Close Inversion (else wick)", group = G5, tooltip = "ON: an FVG only inverts when a candle CLOSES through the far side.\nOFF: a wick through the far side is enough.")
+ifvgRetestWick = input.bool(true,  "Allow Wick Retest (else close inside)", group = G5)
+ifvgRequireRt  = input.bool(true,  "Require Retest Before Entry", group = G5, tooltip = "Keep ON for the model. OFF fires entries at the inversion break itself (aggressive).")
+ifvgMaxAge     = input.int (120,   "Zone Expiry (bars)", minval = 20, maxval = 500, group = G5)
+showIfvg       = input.bool(true,  "Show IFVG Zones",    group = G5)
+
+// — 6 · V-shape recovery
+vMaxBars = input.int  (5,    "Max Bars After Sweep",       minval = 1,  maxval = 15,  group = G6)
+vDispAtr = input.float(1.0,  "Displacement Body (×ATR)",   minval = 0.3, maxval = 3.0, step = 0.1, group = G6)
+vRetrace = input.float(75,   "Min Sweep-Leg Recovery (%)", minval = 20, maxval = 150, step = 5,   group = G6, tooltip = "100% = close fully reclaims the swept level.")
+
+// — 7 · HTF
+htf1On = input.bool(true,  "", inline = "h1", group = G7)
+htf1Tf = input.timeframe("15",  "HTF 1", inline = "h1", group = G7)
+htf2On = input.bool(true,  "", inline = "h2", group = G7)
+htf2Tf = input.timeframe("60",  "HTF 2", inline = "h2", group = G7)
+htf3On = input.bool(true,  "", inline = "h3", group = G7)
+htf3Tf = input.timeframe("240", "HTF 3", inline = "h3", group = G7)
+
+// — 8 · Premium / Discount
+pdAuto     = input.bool (true, "Automatic Dealing Range (last major swings)", group = G8)
+pdManualHi = input.price(0.0,  "Manual Range High", group = G8)
+pdManualLo = input.price(0.0,  "Manual Range Low",  group = G8)
+pdShow     = input.bool (true, "Show Premium / Discount Zones", group = G8)
+
+// — 9 · DOL
+dolMinRR = input.float(2.0, "Min Target Distance (R)", minval = 0.5, maxval = 10, step = 0.5, group = G9, tooltip = "The opposite liquidity pool must sit at least this many R away to score the DOL point.")
+showDol  = input.bool (true, "Show Draw-On-Liquidity Marker", group = G9)
+
+// — 10 · SMT
+smtOn    = input.bool  (false, "Enable SMT Divergence", group = G10)
+smtSym   = input.symbol("CME_MINI:ES1!", "Comparison Symbol", group = G10)
+smtLb    = input.int   (10, "Divergence Lookback (bars)", minval = 3, maxval = 50, group = G10)
+smtValid = input.int   (20, "Signal Validity (bars)",     minval = 5, maxval = 100, group = G10)
+
+// — 11 · Setup engine
+setupWindow = input.int (30,   "Sweep → Entry Max Window (bars)", minval = 5, maxval = 100, group = G11)
+oneAtATime  = input.bool(true, "One Trade At A Time", group = G11)
+minRating   = input.string("A", "Minimum Rating To Signal", options = ["A", "A+", "A++"], group = G11)
+
+// — 12 · Trade management
+slMode    = input.string("Liquidity", "Stop Loss Mode", options = ["Liquidity", "Swing", "ATR"], group = G12)
+slAtrMult = input.float (1.5, "ATR Stop Multiple",   minval = 0.5, maxval = 5.0, step = 0.1, group = G12)
+slBufAtr  = input.float (0.1, "Stop Buffer (×ATR)",  minval = 0.0, maxval = 1.0, step = 0.05, group = G12)
+beR       = input.float (0.5, "Break-Even Trigger (R)", minval = 0.1, maxval = 2.0, step = 0.1, group = G12)
+tp1R      = input.float (1.0, "TP1 (R)", minval = 0.5, maxval = 5.0,  step = 0.25, group = G12)
+tp2R      = input.float (2.0, "TP2 (R)", minval = 1.0, maxval = 10.0, step = 0.25, group = G12)
+
+// — 13 · Dashboard
+dashOn   = input.bool  (true, "Show Dashboard", group = G13)
+dashPos  = input.string("Top Right", "Position", options = ["Top Right", "Middle Right", "Bottom Right"], group = G13)
+dashSize = input.string("Normal", "Text Size",  options = ["Tiny", "Small", "Normal"], group = G13)
+
+// — 14 · Style
+colBull    = input.color(#089981,                 "Bullish",        group = G14, inline = "c1")
+colBear    = input.color(#f23645,                 "Bearish",        group = G14, inline = "c1")
+colEntry   = input.color(#2962ff,                 "Entry",          group = G14, inline = "c2")
+colFvgBull = input.color(color.new(#2962ff, 85),  "Bull FVG",       group = G14, inline = "c3")
+colFvgBear = input.color(color.new(#787b86, 82),  "Bear FVG",       group = G14, inline = "c3")
+colIfvgBu  = input.color(color.new(#00bcd4, 78),  "Bull IFVG",      group = G14, inline = "c4")
+colIfvgBe  = input.color(color.new(#9c27b0, 78),  "Bear IFVG",      group = G14, inline = "c4")
+colPrem    = input.color(color.new(#f23645, 92),  "Premium",        group = G14, inline = "c5")
+colDisc    = input.color(color.new(#089981, 92),  "Discount",       group = G14, inline = "c5")
+
+// ══════════════════════════════════════════════════════════════════ GLOBALS
+float atr      = ta.atr(14)
+bool  confirmed = barstate.isconfirmed
+
+// ══════════════════════════════════════════════════════════════════ TYPES
+// A resting liquidity pool (swing high/low, EQH/EQL, session or daily extreme).
+type Liq
+    float price
+    int   barIdx
+    int   side      // BULL = buy-side (above price), BEAR = sell-side (below)
+    bool  swept   = false
+    bool  isEq    = false
+    string tag    = ""
+    line  ln      = na
+    label lb      = na
+
+// A fair value gap (3-candle imbalance).
+type Fvg
+    float top
+    float bot
+    int   dir       // BULL / BEAR
+    int   startBar
+    int   state   = 0
+    box   bx      = na
+
+// An inverted fair value gap — the tradeable zone of the model.
+type Ifvg
+    float top
+    float bot
+    int   dir       // BULL = broken-up bearish FVG (support), BEAR = mirror
+    int   invBar
+    bool  retested = false
+    bool  dead     = false
+    box   bx       = na
+
+// A managed trade plan.
+type Trade
+    int    dir
+    float  entry
+    float  stop        // current stop (moves to BE)
+    float  origStop
+    float  beLevel
+    float  tp1
+    float  tp2
+    int    score
+    string rating
+    int    barOpened
+    bool   beMoved  = false
+    bool   tp1Hit   = false
+    bool   closed   = false
+    line   lnEntry  = na
+    line   lnStop   = na
+    line   lnTp1    = na
+    line   lnTp2    = na
+    label  lbInfo   = na
+
+// ═══════════════════════════════════════ MODULE 1 · MARKET STRUCTURE ENGINE
+// Swing pivots confirm msSwingLen bars after the extreme. A close through the
+// last swing high/low is a BOS (with trend) or CHoCH (against trend) and sets
+// the directional bias that gates every setup.
+float ph  = ta.pivothigh(high, msSwingLen, msSwingLen)
+float pl  = ta.pivotlow (low,  msSwingLen, msSwingLen)
+float iph = ta.pivothigh(high, msIntLen, msIntLen)
+float ipl = ta.pivotlow (low,  msIntLen, msIntLen)
+
+var float lastSH    = na
+var float lastSL    = na
+var int   lastSHBar = na
+var int   lastSLBar = na
+var bool  shTaken   = false
+var bool  slTaken   = false
+var int   bias      = FLAT
+var int   intBias   = FLAT
+var float lastIntSH = na
+var float lastIntSL = na
+
+bool bosUp = false
+bool bosDn = false
+bool chUp  = false
+bool chDn  = false
+
+if confirmed
+    if not na(ph)
+        lastSH    := ph
+        lastSHBar := bar_index - msSwingLen
+        shTaken   := false
+    if not na(pl)
+        lastSL    := pl
+        lastSLBar := bar_index - msSwingLen
+        slTaken   := false
+    if not na(iph)
+        lastIntSH := iph
+    if not na(ipl)
+        lastIntSL := ipl
+
+    // External structure breaks (close-based, evaluated on bar close only)
+    if not shTaken and not na(lastSH) and close > lastSH
+        shTaken := true
+        chUp    := bias == BEAR
+        bosUp   := not chUp
+        bias    := BULL
+    if not slTaken and not na(lastSL) and close < lastSL
+        slTaken := true
+        chDn    := bias == BULL
+        bosDn   := not chDn
+        bias    := BEAR
+
+    // Internal structure (momentum proxy for the V-shape engine)
+    if not na(lastIntSH) and close > lastIntSH
+        intBias   := BULL
+        lastIntSH := na
+    if not na(lastIntSL) and close < lastIntSL
+        intBias   := BEAR
+        lastIntSL := na
+
+// Optional HTF bias filter — last CLOSED bar of the filter TF vs its EMA-50.
+[hfC, hfE] = request.security(syminfo.tickerid, msHtfFilterTf,
+     [close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_on)
+int htfFilterBias = hfC > hfE ? BULL : hfC < hfE ? BEAR : FLAT
+int effBias = msHtfFilter ? (bias == htfFilterBias ? bias : FLAT) : bias
+
+if showStructure and confirmed
+    if bosUp or chUp
+        label.new(bar_index, lastSH, chUp ? "CHoCH" : "BOS",
+             style = label.style_label_down, color = color.new(colBull, 60),
+             textcolor = colBull, size = size.tiny)
+    if bosDn or chDn
+        label.new(bar_index, lastSL, chDn ? "CHoCH" : "BOS",
+             style = label.style_label_up, color = color.new(colBear, 60),
+             textcolor = colBear, size = size.tiny)
+
+// ═══════════════════════════════════════════ MODULE 2 · LIQUIDITY ENGINE
+// Confirmed swing pivots, session extremes and prior-day extremes are stored
+// as resting pools. Pivots landing within `liqEqAtr × ATR` of an existing
+// unswept pool merge into an EQH/EQL pool (stronger magnet). A sweep = the
+// pool is violated by the wick but price closes back inside the range.
+var array<Liq> bslArr = array.new<Liq>()   // buy-side (above price)
+var array<Liq> sslArr = array.new<Liq>()   // sell-side (below price)
+
+// Latest sweep snapshots consumed by the V-shape / setup engines
+var int   sslSweepBar = na
+var float sslSweepLvl = na
+var float sslSweepLow  = na
+var int   bslSweepBar = na
+var float bslSweepLvl = na
+var float bslSweepHigh = na
+bool newBslSweep = false
+bool newSslSweep = false
+
+f_liqDelete(Liq lq) =>
+    if not na(lq.ln)
+        line.delete(lq.ln)
+    if not na(lq.lb)
+        label.delete(lq.lb)
+
+f_liqAdd(array<Liq> arr, float price, int side, string tag) =>
+    bool merged = false
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Liq lq = array.get(arr, i)
+            if not lq.swept and math.abs(lq.price - price) <= liqEqAtr * atr
+                lq.price := side == BULL ? math.max(lq.price, price) : math.min(lq.price, price)
+                lq.isEq  := true
+                lq.tag   := side == BULL ? "EQH" : "EQL"
+                if not na(lq.ln)
+                    line.set_y1(lq.ln, lq.price)
+                    line.set_y2(lq.ln, lq.price)
+                    line.set_width(lq.ln, 2)
+                merged := true
+                break
+    if not merged
+        Liq nu = Liq.new(price, bar_index, side, tag = tag)
+        if showLiq
+            nu.ln := line.new(bar_index, price, bar_index + 1, price,
+                 color = color.new(side == BULL ? colBear : colBull, 45),
+                 style = line.style_solid, width = 1)
+        array.push(arr, nu)
+        if array.size(arr) > liqMaxLevels
+            f_liqDelete(array.shift(arr))
+
+// Sweep scan for one side; returns [sweptNow, level]
+f_liqSweep(array<Liq> arr, int side) =>
+    bool  hit = false
+    float lvl = na
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Liq lq = array.get(arr, i)
+            if lq.swept
+                continue
+            bool poked    = side == BULL ? high > lq.price : low < lq.price
+            bool backIn   = side == BULL ? close < lq.price : close > lq.price
+            bool rejClose = side == BULL ? close < open : close > open
+            if poked and backIn and (not liqCloseConf or rejClose)
+                lq.swept := true
+                hit := true
+                lvl := na(lvl) ? lq.price : side == BULL ? math.max(lvl, lq.price) : math.min(lvl, lq.price)
+                if showLiq
+                    if not na(lq.ln)
+                        line.set_x2(lq.ln, bar_index)
+                        line.set_color(lq.ln, color.new(color.gray, 70))
+                    lq.lb := label.new(bar_index, lq.price,
+                         (lq.tag != "" ? lq.tag + " " : "") + (side == BULL ? "BSL Sweep" : "SSL Sweep"),
+                         style = side == BULL ? label.style_label_down : label.style_label_up,
+                         color = color.new(side == BULL ? colBear : colBull, 75),
+                         textcolor = side == BULL ? colBear : colBull, size = size.tiny)
+            else if (side == BULL ? close > lq.price : close < lq.price)
+                // Closed straight through: structural break, not a sweep — retire the pool.
+                lq.swept := true
+                if not na(lq.ln)
+                    line.set_x2(lq.ln, bar_index)
+                    line.set_color(lq.ln, color.new(color.gray, 85))
+    [hit, lvl]
+
+// Session tracking ­— extremes become pools when the session closes.
+bool inAsia = not na(time(timeframe.period, sesAsia,   sesTz))
+bool inLdn  = not na(time(timeframe.period, sesLondon, sesTz))
+bool inNy   = not na(time(timeframe.period, sesNy,     sesTz))
+var float asiaHi = na
+var float asiaLo = na
+var float ldnHi  = na
+var float ldnLo  = na
+var float nyHi   = na
+var float nyLo   = na
+
+// Prior-day extremes (last CLOSED daily bar — non-repainting)
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]],
+     lookahead = barmerge.lookahead_on)
+bool newDay = ta.change(time("D")) != 0
+
+if confirmed
+    // — sessions
+    if sesShow
+        if inAsia
+            asiaHi := inAsia[1] ? math.max(asiaHi, high) : high
+            asiaLo := inAsia[1] ? math.min(asiaLo, low)  : low
+        if not inAsia and inAsia[1] and not na(asiaHi)
+            f_liqAdd(bslArr, asiaHi, BULL, "Asia H")
+            f_liqAdd(sslArr, asiaLo, BEAR, "Asia L")
+        if inLdn
+            ldnHi := inLdn[1] ? math.max(ldnHi, high) : high
+            ldnLo := inLdn[1] ? math.min(ldnLo, low)  : low
+        if not inLdn and inLdn[1] and not na(ldnHi)
+            f_liqAdd(bslArr, ldnHi, BULL, "London H")
+            f_liqAdd(sslArr, ldnLo, BEAR, "London L")
+        if inNy
+            nyHi := inNy[1] ? math.max(nyHi, high) : high
+            nyLo := inNy[1] ? math.min(nyLo, low)  : low
+        if not inNy and inNy[1] and not na(nyHi)
+            f_liqAdd(bslArr, nyHi, BULL, "NY H")
+            f_liqAdd(sslArr, nyLo, BEAR, "NY L")
+
+    // — prior-day levels
+    if newDay and not na(pdh)
+        f_liqAdd(bslArr, pdh, BULL, "PDH")
+        f_liqAdd(sslArr, pdl, BEAR, "PDL")
+
+    // — swing pivots
+    if not na(ph)
+        f_liqAdd(bslArr, ph, BULL, "")
+    if not na(pl)
+        f_liqAdd(sslArr, pl, BEAR, "")
+
+    // — sweep detection
+    [bslHit, bslLvl] = f_liqSweep(bslArr, BULL)
+    [sslHit, sslLvl] = f_liqSweep(sslArr, BEAR)
+    if bslHit
+        newBslSweep  := true
+        bslSweepBar  := bar_index
+        bslSweepLvl  := bslLvl
+        bslSweepHigh := high
+    if sslHit
+        newSslSweep  := true
+        sslSweepBar  := bar_index
+        sslSweepLvl  := sslLvl
+        sslSweepLow  := low
+
+    // — extend live level lines
+    if showLiq
+        if array.size(bslArr) > 0
+            for i = 0 to array.size(bslArr) - 1
+                Liq lq = array.get(bslArr, i)
+                if not lq.swept and not na(lq.ln)
+                    line.set_x2(lq.ln, bar_index + 1)
+        if array.size(sslArr) > 0
+            for i = 0 to array.size(sslArr) - 1
+                Liq lq = array.get(sslArr, i)
+                if not lq.swept and not na(lq.ln)
+                    line.set_x2(lq.ln, bar_index + 1)
+
+// ═══════════════════════════════════════════════ MODULE 3 · FVG ENGINE
+// Bullish FVG: candle-1 high < candle-3 low. Bearish: candle-1 low > candle-3
+// high. Detected on the close of candle 3 — never earlier, never repainted.
+var array<Fvg>  fvgArr  = array.new<Fvg>()
+var array<Ifvg> ifvgArr = array.new<Ifvg>()
+
+bool newBullIfvg = false   // a bearish FVG just inverted upward
+bool newBearIfvg = false
+float newIfvgTop = na
+float newIfvgBot = na
+
+f_fvgRemove(int idx) =>
+    Fvg f = array.get(fvgArr, idx)
+    if not na(f.bx)
+        box.delete(f.bx)
+    array.remove(fvgArr, idx)
+
+if confirmed
+    // — detection (gap measured on the just-closed 3-candle window)
+    bool  bullGap = low > high[2] and (low - high[2]) >= fvgMinAtr * atr
+    bool  bearGap = high < low[2] and (low[2] - high) >= fvgMinAtr * atr
+    if bullGap
+        Fvg f = Fvg.new(low, high[2], BULL, bar_index - 2)
+        if showFvg
+            f.bx := box.new(bar_index - 2, f.top, bar_index + 1, f.bot,
+                 border_color = color.new(colFvgBull, 40), bgcolor = colFvgBull)
+        array.push(fvgArr, f)
+    if bearGap
+        Fvg f = Fvg.new(low[2], high, BEAR, bar_index - 2)
+        if showFvg
+            f.bx := box.new(bar_index - 2, f.top, bar_index + 1, f.bot,
+                 border_color = color.new(colFvgBear, 40), bgcolor = colFvgBear)
+        array.push(fvgArr, f)
+
+    // — lifecycle: mitigation → fill → inversion (inversion spawns an IFVG)
+    if array.size(fvgArr) > 0
+        for i = array.size(fvgArr) - 1 to 0
+            Fvg f = array.get(fvgArr, i)
+            if f.state == FVG_FILLED
+                continue
+            if bar_index <= f.startBar + 2   // zone born this bar — no lifecycle yet
+                if not na(f.bx)
+                    box.set_right(f.bx, bar_index + 1)
+                continue
+            bool isBull = f.dir == BULL
+            // MODULE 4 handoff — inversion trigger
+            bool inverted = isBull ?
+                 (ifvgCloseBreak ? close < f.bot : low  < f.bot) :
+                 (ifvgCloseBreak ? close > f.top : high > f.top)
+            if inverted
+                // Bull FVG broken down → bearish IFVG; bear FVG broken up → bullish IFVG
+                int invDir = isBull ? BEAR : BULL
+                Ifvg iv = Ifvg.new(f.top, f.bot, invDir, bar_index)
+                if showIfvg
+                    iv.bx := box.new(bar_index, f.top, bar_index + 4, f.bot,
+                         border_color = invDir == BULL ? colBull : colBear,
+                         border_width = 1,
+                         bgcolor = invDir == BULL ? colIfvgBu : colIfvgBe,
+                         text = "IFVG", text_size = size.tiny,
+                         text_color = color.new(invDir == BULL ? colBull : colBear, 30))
+                array.push(ifvgArr, iv)
+                newBullIfvg := newBullIfvg or invDir == BULL
+                newBearIfvg := newBearIfvg or invDir == BEAR
+                newIfvgTop  := f.top
+                newIfvgBot  := f.bot
+                if not na(f.bx)
+                    box.set_right(f.bx, bar_index)
+                    box.set_bgcolor(f.bx, color.new(color.gray, 92))
+                f.state := FVG_INVERTED
+                f_fvgRemove(i)
+                continue
+            // full fill without close-through
+            bool filled = isBull ? low <= f.bot : high >= f.top
+            if filled
+                f.state := FVG_FILLED
+                if not na(f.bx)
+                    box.set_right(f.bx, bar_index)
+                    box.set_bgcolor(f.bx, color.new(color.gray, 94))
+                if not fvgKeepHist
+                    f_fvgRemove(i)
+                continue
+            // first touch = mitigated
+            if f.state == FVG_ACTIVE and (isBull ? low <= f.top : high >= f.bot)
+                f.state := FVG_MITIGATED
+            if not na(f.bx)
+                box.set_right(f.bx, bar_index + 1)
+    // cap memory
+    while array.size(fvgArr) > fvgMaxKeep
+        f_fvgRemove(0)
+
+// ═══════════════════════════════════════════════ MODULE 4 · IFVG ENGINE
+// The inverted zone is the trade location: prior resistance (bearish FVG)
+// becomes support after an upward break, and vice-versa. Entry is only armed
+// on the FIRST retest of the flipped zone while it holds.
+bool bullRetestNow = false
+bool bearRetestNow = false
+float rtZoneTop = na
+float rtZoneBot = na
+
+if confirmed and array.size(ifvgArr) > 0
+    for i = array.size(ifvgArr) - 1 to 0
+        Ifvg iv = array.get(ifvgArr, i)
+        if iv.dead
+            continue
+        bool isBull = iv.dir == BULL
+        // zone failure: close through the far side kills the inversion
+        bool failed = isBull ? close < iv.bot : close > iv.top
+        bool tooOld = bar_index - iv.invBar > ifvgMaxAge
+        if failed or tooOld
+            iv.dead := true
+            if not na(iv.bx)
+                box.set_right(iv.bx, bar_index)
+                box.set_bgcolor(iv.bx, color.new(color.gray, 94))
+            continue
+        // retest: price returns into the flipped zone and it holds
+        if not iv.retested and bar_index > iv.invBar
+            bool touch = isBull ?
+                 (ifvgRetestWick ? low <= iv.top : close <= iv.top) :
+                 (ifvgRetestWick ? high >= iv.bot : close >= iv.bot)
+            bool holds = isBull ? close >= iv.bot : close <= iv.top
+            if touch and holds
+                iv.retested := true
+                bullRetestNow := bullRetestNow or isBull
+                bearRetestNow := bearRetestNow or not isBull
+                rtZoneTop := iv.top
+                rtZoneBot := iv.bot
+        if not na(iv.bx)
+            box.set_right(iv.bx, bar_index + 1)
+    // cap memory
+    while array.size(ifvgArr) > fvgMaxKeep
+        Ifvg old = array.shift(ifvgArr)
+        if not na(old.bx)
+            box.delete(old.bx)
+
+// Aggressive mode: treat the inversion break itself as the trigger
+if not ifvgRequireRt and (newBullIfvg or newBearIfvg)
+    bullRetestNow := bullRetestNow or newBullIfvg
+    bearRetestNow := bearRetestNow or newBearIfvg
+    rtZoneTop := newIfvgTop
+    rtZoneBot := newIfvgBot
+
+// ═══════════════════════════════════ MODULE 5 · V-SHAPE RECOVERY ENGINE
+// After a sweep the reversal must be violent: within `vMaxBars` a single
+// displacement candle (body ≥ vDispAtr × ATR) must recover ≥ vRetrace % of
+// the sweep excursion, with internal structure flipping the same way.
+var int vUpBar = na
+var int vDnBar = na
+
+if confirmed
+    // bullish V after an SSL raid
+    if not na(sslSweepBar) and bar_index > sslSweepBar and bar_index - sslSweepBar <= vMaxBars
+        float depth = math.max(sslSweepLvl - sslSweepLow, syminfo.mintick)
+        float recPct = (close - sslSweepLow) / depth * 100
+        bool  disp = close - open >= vDispAtr * atr
+        if disp and recPct >= vRetrace and intBias == BULL
+            vUpBar := bar_index
+    // bearish V after a BSL raid
+    if not na(bslSweepBar) and bar_index > bslSweepBar and bar_index - bslSweepBar <= vMaxBars
+        float depth = math.max(bslSweepHigh - bslSweepLvl, syminfo.mintick)
+        float recPct = (bslSweepHigh - close) / depth * 100
+        bool  disp = open - close >= vDispAtr * atr
+        if disp and recPct >= vRetrace and intBias == BEAR
+            vDnBar := bar_index
+
+// Setup-window persistence flags
+bool sweepUpValid = not na(sslSweepBar) and bar_index - sslSweepBar <= setupWindow
+bool sweepDnValid = not na(bslSweepBar) and bar_index - bslSweepBar <= setupWindow
+bool vUpValid = not na(vUpBar) and bar_index - vUpBar <= setupWindow and not na(sslSweepBar) and vUpBar >= sslSweepBar
+bool vDnValid = not na(vDnBar) and bar_index - vDnBar <= setupWindow and not na(bslSweepBar) and vDnBar >= bslSweepBar
+
+// ══════════════════════════════════════════ MODULE 6 · HTF ENGINE
+// Confirmed-bar OHLC of each HTF (offset [1..3] + lookahead_on = closed bars
+// only). Detects HTF FVGs, flips them to HTF IFVGs on violation, and derives
+// a lightweight HTF bias (closed HTF close vs its EMA-20).
+f_htfData(string tf) =>
+    request.security(syminfo.tickerid, tf,
+         [high[3], low[3], high[1], low[1], close[1], ta.ema(close, 20)[1]],
+         lookahead = barmerge.lookahead_on)
+
+[h1A, l1A, h1C, l1C, c1, e1] = f_htfData(htf1Tf)
+[h2A, l2A, h2C, l2C, c2, e2] = f_htfData(htf2Tf)
+[h3A, l3A, h3C, l3C, c3, e3] = f_htfData(htf3Tf)
+
+// active HTF zone per timeframe: dir 0 = none, ±1 = FVG, ±2 = IFVG (flipped)
+var array<float> htfTop = array.new_float(3, na)
+var array<float> htfBot = array.new_float(3, na)
+var array<int>   htfDir = array.new_int(3, 0)
+
+bool newHtf1 = timeframe.change(htf1Tf)
+bool newHtf2 = timeframe.change(htf2Tf)
+bool newHtf3 = timeframe.change(htf3Tf)
+bool htf1Big = timeframe.in_seconds(htf1Tf) > timeframe.in_seconds(timeframe.period)
+bool htf2Big = timeframe.in_seconds(htf2Tf) > timeframe.in_seconds(timeframe.period)
+bool htf3Big = timeframe.in_seconds(htf3Tf) > timeframe.in_seconds(timeframe.period)
+
+f_htfZone(int idx, bool enabled, bool newHtfBar, float hA, float lA, float hC, float lC) =>
+    if enabled and confirmed
+        if newHtfBar
+            if lC > hA                       // fresh HTF bullish FVG
+                array.set(htfTop, idx, lC)
+                array.set(htfBot, idx, hA)
+                array.set(htfDir, idx, BULL)
+            else if hC < lA                  // fresh HTF bearish FVG
+                array.set(htfTop, idx, lA)
+                array.set(htfBot, idx, hC)
+                array.set(htfDir, idx, BEAR)
+        int   d = array.get(htfDir, idx)
+        float t = array.get(htfTop, idx)
+        float b = array.get(htfBot, idx)
+        if d != 0
+            if (d == BULL or d == -2) and close < b        // support side violated
+                array.set(htfDir, idx, d == BULL ? 2 * BEAR : 0)   // FVG→IFVG, IFVG→dead
+            else if (d == BEAR or d == 2) and close > t    // resistance side violated
+                array.set(htfDir, idx, d == BEAR ? 2 * BULL : 0)
+
+f_htfZone(0, htf1On and htf1Big, newHtf1, h1A, l1A, h1C, l1C)
+f_htfZone(1, htf2On and htf2Big, newHtf2, h2A, l2A, h2C, l2C)
+f_htfZone(2, htf3On and htf3Big, newHtf3, h3A, l3A, h3C, l3C)
+
+// Longs are supported by HTF bull FVGs (+1) or bullish HTF IFVGs (+2); mirror for shorts.
+f_htfSupports(int dir) =>
+    bool ok = false
+    for i = 0 to 2
+        int d = array.get(htfDir, i)
+        bool on = i == 0 ? htf1On : i == 1 ? htf2On : htf3On
+        if on and (dir == BULL ? (d == BULL or d == 2) : (d == BEAR or d == -2))
+            ok := true
+    ok
+
+int htfBias1 = not htf1On ? FLAT : c1 > e1 ? BULL : BEAR
+int htfBias2 = not htf2On ? FLAT : c2 > e2 ? BULL : BEAR
+int htfBias3 = not htf3On ? FLAT : c3 > e3 ? BULL : BEAR
+f_htfAligned(int dir) =>
+    int n = 0
+    n += htfBias1 == dir ? 1 : 0
+    n += htfBias2 == dir ? 1 : 0
+    n += htfBias3 == dir ? 1 : 0
+    n
+
+// ═══════════════════════════════ MODULE 7 · PREMIUM / DISCOUNT ENGINE
+// Dealing range = last confirmed major swing high/low (or manual anchors).
+float rngHi = pdAuto ? lastSH : pdManualHi
+float rngLo = pdAuto ? lastSL : pdManualLo
+float rngEq = (rngHi + rngLo) / 2
+bool  rangeOk    = not na(rngHi) and not na(rngLo) and rngHi > rngLo
+bool  inDiscount = rangeOk and close < rngEq
+bool  inPremium  = rangeOk and close > rngEq
+
+var box  premBox = na
+var box  discBox = na
+var line eqLine  = na
+if barstate.islast and pdShow and rangeOk
+    int xL = pdAuto ? math.min(nz(lastSHBar, bar_index - 50), nz(lastSLBar, bar_index - 50)) : bar_index - 50
+    if na(premBox)
+        premBox := box.new(xL, rngHi, bar_index + 8, rngEq, border_color = na, bgcolor = colPrem)
+        discBox := box.new(xL, rngEq, bar_index + 8, rngLo, border_color = na, bgcolor = colDisc)
+        eqLine  := line.new(xL, rngEq, bar_index + 8, rngEq, color = color.new(color.gray, 40), style = line.style_dashed)
+    else
+        box.set_lefttop(premBox, xL, rngHi)
+        box.set_rightbottom(premBox, bar_index + 8, rngEq)
+        box.set_lefttop(discBox, xL, rngEq)
+        box.set_rightbottom(discBox, bar_index + 8, rngLo)
+        line.set_xy1(eqLine, xL, rngEq)
+        line.set_xy2(eqLine, bar_index + 8, rngEq)
+
+// ═══════════════════════════════ MODULE 8 · DRAW-ON-LIQUIDITY ENGINE
+// Nearest UNSWEPT pool on each side of price = the magnet price should draw to.
+f_nearestPool(array<Liq> arr, int side) =>
+    float best = na
+    string tag = ""
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            Liq lq = array.get(arr, i)
+            if lq.swept
+                continue
+            if side == BULL and lq.price > close and (na(best) or lq.price < best)
+                best := lq.price
+                tag  := lq.tag
+            if side == BEAR and lq.price < close and (na(best) or lq.price > best)
+                best := lq.price
+                tag  := lq.tag
+    [best, tag]
+
+[dolUp, dolUpTag] = f_nearestPool(bslArr, BULL)
+[dolDn, dolDnTag] = f_nearestPool(sslArr, BEAR)
+
+var label dolLb = na
+if barstate.islast and showDol
+    float dolPrice = effBias == BULL ? dolUp : effBias == BEAR ? dolDn : na
+    string dolTag  = effBias == BULL ? dolUpTag : dolDnTag
+    if not na(dolLb)
+        label.delete(dolLb)
+    if not na(dolPrice)
+        dolLb := label.new(bar_index + 6, dolPrice,
+             "◎ DOL " + (dolTag != "" ? dolTag + " " : "") + str.tostring(dolPrice, format.mintick),
+             style = label.style_label_left, color = color.new(color.orange, 70),
+             textcolor = color.orange, size = size.small)
+
+// ═══════════════════════════════ MODULE 9 · SMT DIVERGENCE ENGINE
+// Chart symbol prints a new extreme over the lookback while the correlated
+// symbol fails to → engineered move on one leg of the pair.
+[cmpH, cmpL] = request.security(smtSym, timeframe.period, [high[1], low[1]],
+     lookahead = barmerge.lookahead_on)
+var int smtBullBar = na
+var int smtBearBar = na
+bool chartLL = low[1]  < ta.lowest(low, smtLb)[2]
+bool compLL  = cmpL    < ta.lowest(cmpL, smtLb)[1]
+bool chartHH = high[1] > ta.highest(high, smtLb)[2]
+bool compHH  = cmpH    > ta.highest(cmpH, smtLb)[1]
+if confirmed and smtOn
+    if chartLL and not compLL
+        smtBullBar := bar_index
+    if chartHH and not compHH
+        smtBearBar := bar_index
+bool smtBullValid = smtOn and not na(smtBullBar) and bar_index - smtBullBar <= smtValid
+bool smtBearValid = smtOn and not na(smtBearBar) and bar_index - smtBearBar <= smtValid
+
+// ═══════════════════ MODULE 10 · SCORING ENGINE + TRADE SETUP ENGINE
+// Required legs (all four, worth the 4-point base):
+//   bias alignment · liquidity sweep · V-shape recovery · IFVG retest
+// Confluence points: HTF FVG/IFVG +1 · premium/discount +1 · DOL ≥ minRR +1
+// · SMT +1.   4-5 → A · 6 → A+ · 7-8 → A++
+var Trade activeTrade = na
+var array<Trade> book = array.new<Trade>()
+
+// dashboard snapshot of the most recent setup
+var string lsRating = "—"
+var int    lsDir    = FLAT
+var bool   lsBias = false
+var bool lsSweep = false
+var bool lsHtf = false
+var bool   lsV    = false
+var bool lsIfvg  = false
+var bool lsDol = false
+var bool   lsSmt  = false
+var bool lsPd    = false
+var int    cntA = 0
+var int cntAp = 0
+var int cntApp = 0
+var int    longW = 0
+var int longL = 0
+var int shortW = 0
+var int shortL = 0
+
+f_rating(int score) =>
+    score >= 7 ? "A++" : score == 6 ? "A+" : "A"
+f_ratingOk(string r) =>
+    minRating == "A" ? true : minRating == "A+" ? r != "A" : r == "A++"
+
+f_stop(int dir, float entry) =>
+    float buf = slBufAtr * atr
+    float raw = switch slMode
+        "Liquidity" => dir == BULL ?
+             math.min(nz(sslSweepLow, entry - slAtrMult * atr), nz(rtZoneBot, entry)) :
+             math.max(nz(bslSweepHigh, entry + slAtrMult * atr), nz(rtZoneTop, entry))
+        "Swing"     => dir == BULL ? nz(lastSL, entry - slAtrMult * atr) : nz(lastSH, entry + slAtrMult * atr)
+        => dir == BULL ? entry - slAtrMult * atr : entry + slAtrMult * atr
+    dir == BULL ? raw - buf : raw + buf
+
+f_openTrade(int dir, int score, string rating) =>
+    float entry = close
+    float stop  = f_stop(dir, entry)
+    float risk  = math.abs(entry - stop)
+    if risk > syminfo.mintick
+        float be  = entry + dir * beR  * risk
+        float tp1 = entry + dir * tp1R * risk
+        float tp2 = entry + dir * tp2R * risk
+        Trade t = Trade.new(dir, entry, stop, stop, be, tp1, tp2, score, rating, bar_index)
+        int x2 = bar_index + 12
+        t.lnEntry := line.new(bar_index, entry, x2, entry, color = colEntry,             width = 2)
+        t.lnStop  := line.new(bar_index, stop,  x2, stop,  color = colBear,              width = 2)
+        t.lnTp1   := line.new(bar_index, tp1,   x2, tp1,   color = color.new(colBull, 30), width = 1)
+        t.lnTp2   := line.new(bar_index, tp2,   x2, tp2,   color = colBull,              width = 2)
+        t.lbInfo  := label.new(x2, entry,
+             rating + (dir == BULL ? "  LONG" : "  SHORT")
+             + "\nEntry " + str.tostring(entry, format.mintick)
+             + "\nSL "    + str.tostring(stop,  format.mintick)
+             + "\nBE "    + str.tostring(be,    format.mintick)
+             + "\nTP1 "   + str.tostring(tp1,   format.mintick)
+             + "\nTP2 "   + str.tostring(tp2,   format.mintick),
+             style = label.style_label_left, textalign = text.align_left,
+             color = color.new(colEntry, 82), textcolor = chart.fg_color, size = size.small)
+        activeTrade := t
+        array.push(book, t)
+        if array.size(book) > 30
+            Trade old = array.shift(book)
+            if old.closed
+                line.delete(old.lnEntry)
+                line.delete(old.lnStop)
+                line.delete(old.lnTp1)
+                line.delete(old.lnTp2)
+                label.delete(old.lbInfo)
+        t
+    else
+        Trade(na)
+
+// — setup evaluation (bar-close only)
+bool longSignal  = false
+bool shortSignal = false
+int  sigScore    = 0
+string sigRating = "—"
+
+bool canTrade = not oneAtATime or na(activeTrade)
+
+if confirmed and canTrade
+    bool longBase  = effBias == BULL and sweepUpValid and vUpValid and bullRetestNow
+    bool shortBase = effBias == BEAR and sweepDnValid and vDnValid and bearRetestNow
+    if longBase or shortBase
+        int  dir  = longBase ? BULL : BEAR
+        bool htfP = f_htfSupports(dir)
+        bool pdP  = dir == BULL ? inDiscount : inPremium
+        bool smtP = dir == BULL ? smtBullValid : smtBearValid
+        // provisional risk for the DOL distance check
+        float pEntry = close
+        float pStop  = f_stop(dir, pEntry)
+        float pRisk  = math.abs(pEntry - pStop)
+        bool dolP = pRisk > syminfo.mintick and (dir == BULL ?
+             not na(dolUp) and dolUp - pEntry >= dolMinRR * pRisk :
+             not na(dolDn) and pEntry - dolDn >= dolMinRR * pRisk)
+        int score = 4 + (htfP ? 1 : 0) + (pdP ? 1 : 0) + (dolP ? 1 : 0) + (smtP ? 1 : 0)
+        string rating = f_rating(score)
+        if f_ratingOk(rating)
+            Trade t = f_openTrade(dir, score, rating)
+            if not na(t)
+                longSignal  := dir == BULL
+                shortSignal := dir == BEAR
+                sigScore    := score
+                sigRating   := rating
+                // stats + dashboard snapshot
+                cntA   += rating == "A"   ? 1 : 0
+                cntAp  += rating == "A+"  ? 1 : 0
+                cntApp += rating == "A++" ? 1 : 0
+                lsRating := rating
+                lsDir  := dir
+                lsBias := true
+                lsSweep := true
+                lsV := true
+                lsIfvg := true
+                lsHtf  := htfP
+                lsPd    := pdP
+                lsDol := dolP
+                lsSmt := smtP
+                // consume the setup so one sweep can't fire twice
+                if dir == BULL
+                    sslSweepBar := na
+                    vUpBar := na
+                else
+                    bslSweepBar := na
+                    vDnBar := na
+
+// ═══════════════════════════ MODULE 11 · TRADE MANAGEMENT ENGINE
+// Conservative intrabar assumption: the stop is checked BEFORE targets on
+// every bar. BE trigger moves the stop to entry; TP1 also forces BE.
+bool tpHitEvt   = false
+bool stopHitEvt = false
+
+if confirmed and not na(activeTrade)
+    Trade t = activeTrade
+    if bar_index > t.barOpened
+        bool isL = t.dir == BULL
+        bool stopped = isL ? low <= t.stop : high >= t.stop
+        if stopped
+            t.closed := true
+            stopHitEvt := true
+            if not t.tp1Hit    // stopped before TP1 = loss (BE exit is flat)
+                if not t.beMoved
+                    if isL
+                        longL += 1
+                    else
+                        shortL += 1
+            label.new(bar_index, t.stop, t.beMoved ? "BE Exit" : "Stop",
+                 style = isL ? label.style_label_up : label.style_label_down,
+                 color = color.new(colBear, 70), textcolor = colBear, size = size.tiny)
+        else
+            if not t.beMoved and (isL ? high >= t.beLevel : low <= t.beLevel)
+                t.beMoved := true
+                t.stop := t.entry
+                line.set_y1(t.lnStop, t.entry)
+                line.set_y2(t.lnStop, t.entry)
+                line.set_color(t.lnStop, color.new(color.gray, 40))
+            if not t.tp1Hit and (isL ? high >= t.tp1 : low <= t.tp1)
+                t.tp1Hit := true
+                tpHitEvt := true
+                t.beMoved := true
+                t.stop := t.entry
+                if isL
+                    longW += 1
+                else
+                    shortW += 1
+                label.new(bar_index, t.tp1, "TP1", style = label.style_label_down,
+                     color = color.new(colBull, 70), textcolor = colBull, size = size.tiny)
+            if isL ? high >= t.tp2 : low <= t.tp2
+                t.closed := true
+                tpHitEvt := true
+                label.new(bar_index, t.tp2, "TP2", style = label.style_label_down,
+                     color = color.new(colBull, 55), textcolor = colBull, size = size.tiny)
+        // extend management lines while live
+        int xr = math.max(bar_index + 2, t.barOpened + 12)
+        line.set_x2(t.lnEntry, xr)
+        line.set_x2(t.lnStop, xr)
+        line.set_x2(t.lnTp1, xr)
+        line.set_x2(t.lnTp2, xr)
+        label.set_x(t.lbInfo, xr)
+        if t.closed
+            activeTrade := na
+
+// ═══════════════════════════════════════════ SIGNAL MARKERS (VISUAL DESIGN)
+plotshape(longSignal,  "Long Signal",  shape.triangleup,   location.belowbar, colBull, size = size.small, text = "LONG")
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.abovebar, colBear, size = size.small, text = "SHORT")
+
+// ═══════════════════════════════════════════ MODULE 12 · DASHBOARD ENGINE
+f_ck(bool v) =>
+    v ? "✓" : "✗"
+f_ckCol(bool v) =>
+    v ? colBull : colBear
+f_pct(int n, int d) =>
+    d == 0 ? "—" : str.tostring(100.0 * n / d, "#.#") + "%"
+
+var table dash = na
+if dashOn and barstate.islast
+    if na(dash)
+        var pos = dashPos == "Top Right" ? position.top_right :
+             dashPos == "Middle Right" ? position.middle_right : position.bottom_right
+        dash := table.new(pos, 2, 19, bgcolor = color.new(chart.bg_color, 15),
+             border_width = 1, border_color = color.new(color.gray, 80),
+             frame_width = 1, frame_color = color.new(color.gray, 60))
+    var txSz = dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : size.normal
+    int totalSetups = cntA + cntAp + cntApp
+
+    table.cell(dash, 0, 0, "SMC IFVG MODEL", text_color = chart.fg_color, text_size = txSz, bgcolor = color.new(colEntry, 75))
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 1, "Market Bias", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, (effBias == BULL ? "BULLISH" : effBias == BEAR ? "BEARISH" : "NEUTRAL")
+         + (effBias != FLAT ? " · HTF " + str.tostring(f_htfAligned(effBias)) + "/3" : ""),
+         text_color = effBias == BULL ? colBull : effBias == BEAR ? colBear : color.gray, text_size = txSz)
+    table.cell(dash, 0, 2, "Last Setup", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 2, lsRating + (lsDir == BULL ? " LONG" : lsDir == BEAR ? " SHORT" : ""),
+         text_color = lsDir == BULL ? colBull : lsDir == BEAR ? colBear : color.gray, text_size = txSz)
+
+    table.cell(dash, 0, 3, "— CHECKLIST —", text_color = color.gray, text_size = txSz)
+    table.merge_cells(dash, 0, 3, 1, 3)
+    string[] ckNames = array.from("Bias", "Liquidity Sweep", "HTF FVG", "V-Shape Recovery",
+         "Inversion FVG", "Premium/Discount", "Clear Opposite DOL", "SMT Divergence")
+    bool[]   ckVals  = array.from(lsBias, lsSweep, lsHtf, lsV, lsIfvg, lsPd, lsDol, lsSmt)
+    for i = 0 to 7
+        table.cell(dash, 0, 4 + i, array.get(ckNames, i), text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 4 + i, f_ck(array.get(ckVals, i)), text_color = f_ckCol(array.get(ckVals, i)), text_size = txSz)
+
+    table.cell(dash, 0, 12, "— STATISTICS —", text_color = color.gray, text_size = txSz)
+    table.merge_cells(dash, 0, 12, 1, 12)
+    table.cell(dash, 0, 13, "A Setups",   text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 13, str.tostring(cntA)   + "  (" + f_pct(cntA, totalSetups)   + ")", text_color = chart.fg_color, text_size = txSz)
+    table.cell(dash, 0, 14, "A+ Setups",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 14, str.tostring(cntAp)  + "  (" + f_pct(cntAp, totalSetups)  + ")", text_color = chart.fg_color, text_size = txSz)
+    table.cell(dash, 0, 15, "A++ Setups", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 15, str.tostring(cntApp) + "  (" + f_pct(cntApp, totalSetups) + ")", text_color = chart.fg_color, text_size = txSz)
+    table.cell(dash, 0, 16, "Long Win Rate",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 16, f_pct(longW,  longW + longL),   text_color = colBull, text_size = txSz)
+    table.cell(dash, 0, 17, "Short Win Rate", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 17, f_pct(shortW, shortW + shortL), text_color = colBear, text_size = txSz)
+    table.cell(dash, 0, 18, "Total Trades", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+    table.cell(dash, 1, 18, str.tostring(totalSetups), text_color = chart.fg_color, text_size = txSz)
+
+// ═══════════════════════════════════════════ MODULE 13 · ALERT ENGINE
+// Static alertconditions (pick from the TradingView "Add Alert" dropdown):
+alertcondition(newBslSweep or newSslSweep, "Liquidity Sweep", "SMC-IFVG: liquidity sweep detected")
+alertcondition(newBullIfvg or newBearIfvg, "IFVG Created",    "SMC-IFVG: inversion FVG created")
+alertcondition((longSignal or shortSignal) and sigRating == "A",   "A Setup",   "SMC-IFVG: A setup triggered")
+alertcondition((longSignal or shortSignal) and sigRating == "A+",  "A+ Setup",  "SMC-IFVG: A+ setup triggered")
+alertcondition((longSignal or shortSignal) and sigRating == "A++", "A++ Setup", "SMC-IFVG: A++ setup triggered")
+alertcondition(longSignal,  "Long Signal",  "SMC-IFVG: long entry signal")
+alertcondition(shortSignal, "Short Signal", "SMC-IFVG: short entry signal")
+alertcondition(tpHitEvt,    "TP Hit",       "SMC-IFVG: take profit hit")
+alertcondition(stopHitEvt,  "Stop Hit",     "SMC-IFVG: stop loss hit")
+
+// Webhook-ready dynamic JSON (fires with "Any alert() function call"):
+if (longSignal or shortSignal) and not na(activeTrade)
+    Trade t = activeTrade
+    string js = "{\"symbol\":\"" + syminfo.ticker
+         + "\",\"direction\":\"" + (t.dir == BULL ? "long" : "short")
+         + "\",\"rating\":\""    + t.rating
+         + "\",\"entry\":\""     + str.tostring(t.entry, format.mintick)
+         + "\",\"stop\":\""      + str.tostring(t.origStop, format.mintick)
+         + "\",\"tp1\":\""       + str.tostring(t.tp1, format.mintick)
+         + "\",\"tp2\":\""       + str.tostring(t.tp2, format.mintick)
+         + "\",\"timeframe\":\"" + timeframe.period + "\"}"
+    alert(js, alert.freq_once_per_bar_close)
+if tpHitEvt
+    alert("{\"symbol\":\"" + syminfo.ticker + "\",\"event\":\"tp_hit\",\"timeframe\":\"" + timeframe.period + "\"}", alert.freq_once_per_bar_close)
+if stopHitEvt
+    alert("{\"symbol\":\"" + syminfo.ticker + "\",\"event\":\"stop_hit\",\"timeframe\":\"" + timeframe.period + "\"}", alert.freq_once_per_bar_close)
