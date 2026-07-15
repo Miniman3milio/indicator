@@ -792,6 +792,7 @@ f_stop(int dir, float entry) =>
     dir == BULL ? raw - buf : raw + buf
 
 f_openTrade(int dir, int score, string rating) =>
+    Trade t = na
     float entry = close
     float stop  = f_stop(dir, entry)
     float risk  = math.abs(entry - stop)
@@ -799,7 +800,7 @@ f_openTrade(int dir, int score, string rating) =>
         float be  = entry + dir * beR  * risk
         float tp1 = entry + dir * tp1R * risk
         float tp2 = entry + dir * tp2R * risk
-        Trade t = Trade.new(dir, entry, stop, stop, be, tp1, tp2, score, rating, bar_index)
+        t := Trade.new(dir, entry, stop, stop, be, tp1, tp2, score, rating, bar_index)
         int x2 = bar_index + 12
         t.lnEntry := line.new(bar_index, entry, x2, entry, color = colEntry,             width = 2)
         t.lnStop  := line.new(bar_index, stop,  x2, stop,  color = colBear,              width = 2)
@@ -814,7 +815,6 @@ f_openTrade(int dir, int score, string rating) =>
              + "\nTP2 "   + str.tostring(tp2,   format.mintick),
              style = label.style_label_left, textalign = text.align_left,
              color = color.new(colEntry, 82), textcolor = chart.fg_color, size = size.small)
-        activeTrade := t
         array.push(book, t)
         if array.size(book) > 30
             Trade old = array.shift(book)
@@ -824,9 +824,7 @@ f_openTrade(int dir, int score, string rating) =>
                 line.delete(old.lnTp1)
                 line.delete(old.lnTp2)
                 label.delete(old.lbInfo)
-        t
-    else
-        Trade(na)
+    t
 
 // — setup evaluation (bar-close only)
 bool longSignal  = false
@@ -856,6 +854,7 @@ if confirmed and canTrade
         if f_ratingOk(rating)
             Trade t = f_openTrade(dir, score, rating)
             if not na(t)
+                activeTrade := t
                 longSignal  := dir == BULL
                 shortSignal := dir == BEAR
                 sigScore    := score
