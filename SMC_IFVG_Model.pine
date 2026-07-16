@@ -1031,6 +1031,7 @@ if dashOn and barstate.islast
 // Static alertconditions (pick from the TradingView "Add Alert" dropdown):
 alertcondition(newBslSweep or newSslSweep, "Liquidity Sweep", "SMC-IFVG: liquidity sweep detected")
 alertcondition(newBullIfvg or newBearIfvg, "IFVG Created",    "SMC-IFVG: inversion FVG created")
+alertcondition(longSignal or shortSignal, "Setup Triggered (Any Rating)", "SMC-IFVG {{ticker}} {{interval}}m: setup triggered @ {{close}}")
 alertcondition((longSignal or shortSignal) and sigRating == "A",   "A Setup",   "SMC-IFVG: A setup triggered")
 alertcondition((longSignal or shortSignal) and sigRating == "A+",  "A+ Setup",  "SMC-IFVG: A+ setup triggered")
 alertcondition((longSignal or shortSignal) and sigRating == "A++", "A++ Setup", "SMC-IFVG: A++ setup triggered")
