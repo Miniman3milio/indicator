@@ -131,6 +131,7 @@ tp2R      = input.float (2.0, "TP2 (R)", minval = 1.0, maxval = 10.0, step = 0.2
 dashOn   = input.bool  (true, "Show Dashboard", group = G13)
 dashPos  = input.string("Top Right", "Position", options = ["Top Right", "Middle Right", "Bottom Right"], group = G13)
 dashSize = input.string("Normal", "Text Size",  options = ["Tiny", "Small", "Normal"], group = G13)
+dashCompact = input.bool(false, "Compact Mode (mobile)", group = G13, tooltip = "Collapses the dashboard to 4 rows: bias, last setup, funnel status, and trade stats. Turn on when trading from a phone.")
 
 // — 14 · Style
 colBull    = input.color(#089981,                 "Bullish",        group = G14, inline = "c1")
@@ -971,16 +972,6 @@ if dashOn and barstate.islast
     var txSz = dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : size.normal
     int totalSetups = cntA + cntAp + cntApp
 
-    table.cell(dash, 0, 0, "SMC IFVG MODEL", text_color = chart.fg_color, text_size = txSz, bgcolor = color.new(colEntry, 75))
-    table.merge_cells(dash, 0, 0, 1, 0)
-    table.cell(dash, 0, 1, "Market Bias", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 1, (effBias == BULL ? "BULLISH" : effBias == BEAR ? "BEARISH" : "NEUTRAL")
-         + (effBias != FLAT ? " · HTF " + str.tostring(f_htfAligned(effBias)) + "/3" : ""),
-         text_color = effBias == BULL ? colBull : effBias == BEAR ? colBear : color.gray, text_size = txSz)
-    table.cell(dash, 0, 2, "Last Setup", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 2, lsRating + (lsDir == BULL ? " LONG" : lsDir == BEAR ? " SHORT" : ""),
-         text_color = lsDir == BULL ? colBull : lsDir == BEAR ? colBear : color.gray, text_size = txSz)
-
     // — live funnel: state of the CURRENT setup being built, not the last fired one
     bool fnSweep = effBias == BULL ? sweepUpValid : effBias == BEAR ? sweepDnValid : false
     bool fnV     = effBias == BULL ? vUpValid : effBias == BEAR ? vDnValid : false
@@ -992,40 +983,65 @@ if dashOn and barstate.islast
          not fnIfvg ? "waiting: IFVG" : "ARMED · awaiting retest"
     color fnCol = not na(activeTrade) and oneAtATime ? colEntry :
          fnSweep and fnV and fnIfvg ? colBull : color.gray
-    table.cell(dash, 0, 3, "— LIVE FUNNEL —", text_color = color.gray, text_size = txSz)
-    table.merge_cells(dash, 0, 3, 1, 3)
-    table.cell(dash, 0, 4, "Liquidity Sweep", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 4, f_ck(fnSweep), text_color = f_ckCol(fnSweep), text_size = txSz)
-    table.cell(dash, 0, 5, "V-Shape Recovery", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 5, f_ck(fnV), text_color = f_ckCol(fnV), text_size = txSz)
-    table.cell(dash, 0, 6, "IFVG Zone Armed", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 6, f_ck(fnIfvg), text_color = f_ckCol(fnIfvg), text_size = txSz)
-    table.cell(dash, 0, 7, "Status", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 7, fnStatus, text_color = fnCol, text_size = txSz)
+    string biasTxt = (effBias == BULL ? "BULLISH" : effBias == BEAR ? "BEARISH" : "NEUTRAL")
+         + (effBias != FLAT ? " · HTF " + str.tostring(f_htfAligned(effBias)) + "/3" : "")
+    color biasCol = effBias == BULL ? colBull : effBias == BEAR ? colBear : color.gray
+    string setupTxt = lsRating + (lsDir == BULL ? " LONG" : lsDir == BEAR ? " SHORT" : "")
+    color setupCol = lsDir == BULL ? colBull : lsDir == BEAR ? colBear : color.gray
 
-    table.cell(dash, 0, 8, "— LAST SETUP CHECKLIST —", text_color = color.gray, text_size = txSz)
-    table.merge_cells(dash, 0, 8, 1, 8)
-    string[] ckNames = array.from("Bias", "Liquidity Sweep", "HTF FVG", "V-Shape Recovery",
-         "Inversion FVG", "Premium/Discount", "Clear Opposite DOL", "SMT Divergence")
-    bool[]   ckVals  = array.from(lsBias, lsSweep, lsHtf, lsV, lsIfvg, lsPd, lsDol, lsSmt)
-    for i = 0 to 7
-        table.cell(dash, 0, 9 + i, array.get(ckNames, i), text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-        table.cell(dash, 1, 9 + i, f_ck(array.get(ckVals, i)), text_color = f_ckCol(array.get(ckVals, i)), text_size = txSz)
+    if dashCompact
+        // 4-row phone layout: bias · last setup · funnel status · stats digest
+        table.cell(dash, 0, 0, "Bias", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 0, biasTxt, text_color = biasCol, text_size = txSz)
+        table.cell(dash, 0, 1, "Setup", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 1, setupTxt, text_color = setupCol, text_size = txSz)
+        table.cell(dash, 0, 2, "Funnel", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 2, fnStatus, text_color = fnCol, text_size = txSz)
+        table.cell(dash, 0, 3, "Trades", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 3, str.tostring(totalSetups) + " · L " + f_pct(longW, longW + longL)
+             + " / S " + f_pct(shortW, shortW + shortL), text_color = chart.fg_color, text_size = txSz)
+    else
+        table.cell(dash, 0, 0, "SMC IFVG MODEL", text_color = chart.fg_color, text_size = txSz, bgcolor = color.new(colEntry, 75))
+        table.merge_cells(dash, 0, 0, 1, 0)
+        table.cell(dash, 0, 1, "Market Bias", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 1, biasTxt, text_color = biasCol, text_size = txSz)
+        table.cell(dash, 0, 2, "Last Setup", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 2, setupTxt, text_color = setupCol, text_size = txSz)
 
-    table.cell(dash, 0, 17, "— STATISTICS —", text_color = color.gray, text_size = txSz)
-    table.merge_cells(dash, 0, 17, 1, 17)
-    table.cell(dash, 0, 18, "A Setups",   text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 18, str.tostring(cntA)   + "  (" + f_pct(cntA, totalSetups)   + ")", text_color = chart.fg_color, text_size = txSz)
-    table.cell(dash, 0, 19, "A+ Setups",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 19, str.tostring(cntAp)  + "  (" + f_pct(cntAp, totalSetups)  + ")", text_color = chart.fg_color, text_size = txSz)
-    table.cell(dash, 0, 20, "A++ Setups", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 20, str.tostring(cntApp) + "  (" + f_pct(cntApp, totalSetups) + ")", text_color = chart.fg_color, text_size = txSz)
-    table.cell(dash, 0, 21, "Long Win Rate",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 21, f_pct(longW,  longW + longL),   text_color = colBull, text_size = txSz)
-    table.cell(dash, 0, 22, "Short Win Rate", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 22, f_pct(shortW, shortW + shortL), text_color = colBear, text_size = txSz)
-    table.cell(dash, 0, 23, "Total Trades", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
-    table.cell(dash, 1, 23, str.tostring(totalSetups), text_color = chart.fg_color, text_size = txSz)
+        table.cell(dash, 0, 3, "— LIVE FUNNEL —", text_color = color.gray, text_size = txSz)
+        table.merge_cells(dash, 0, 3, 1, 3)
+        table.cell(dash, 0, 4, "Liquidity Sweep", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 4, f_ck(fnSweep), text_color = f_ckCol(fnSweep), text_size = txSz)
+        table.cell(dash, 0, 5, "V-Shape Recovery", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 5, f_ck(fnV), text_color = f_ckCol(fnV), text_size = txSz)
+        table.cell(dash, 0, 6, "IFVG Zone Armed", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 6, f_ck(fnIfvg), text_color = f_ckCol(fnIfvg), text_size = txSz)
+        table.cell(dash, 0, 7, "Status", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 7, fnStatus, text_color = fnCol, text_size = txSz)
+
+        table.cell(dash, 0, 8, "— LAST SETUP CHECKLIST —", text_color = color.gray, text_size = txSz)
+        table.merge_cells(dash, 0, 8, 1, 8)
+        string[] ckNames = array.from("Bias", "Liquidity Sweep", "HTF FVG", "V-Shape Recovery",
+             "Inversion FVG", "Premium/Discount", "Clear Opposite DOL", "SMT Divergence")
+        bool[]   ckVals  = array.from(lsBias, lsSweep, lsHtf, lsV, lsIfvg, lsPd, lsDol, lsSmt)
+        for i = 0 to 7
+            table.cell(dash, 0, 9 + i, array.get(ckNames, i), text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+            table.cell(dash, 1, 9 + i, f_ck(array.get(ckVals, i)), text_color = f_ckCol(array.get(ckVals, i)), text_size = txSz)
+
+        table.cell(dash, 0, 17, "— STATISTICS —", text_color = color.gray, text_size = txSz)
+        table.merge_cells(dash, 0, 17, 1, 17)
+        table.cell(dash, 0, 18, "A Setups",   text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 18, str.tostring(cntA)   + "  (" + f_pct(cntA, totalSetups)   + ")", text_color = chart.fg_color, text_size = txSz)
+        table.cell(dash, 0, 19, "A+ Setups",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 19, str.tostring(cntAp)  + "  (" + f_pct(cntAp, totalSetups)  + ")", text_color = chart.fg_color, text_size = txSz)
+        table.cell(dash, 0, 20, "A++ Setups", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 20, str.tostring(cntApp) + "  (" + f_pct(cntApp, totalSetups) + ")", text_color = chart.fg_color, text_size = txSz)
+        table.cell(dash, 0, 21, "Long Win Rate",  text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 21, f_pct(longW,  longW + longL),   text_color = colBull, text_size = txSz)
+        table.cell(dash, 0, 22, "Short Win Rate", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 22, f_pct(shortW, shortW + shortL), text_color = colBear, text_size = txSz)
+        table.cell(dash, 0, 23, "Total Trades", text_color = chart.fg_color, text_size = txSz, text_halign = text.align_left)
+        table.cell(dash, 1, 23, str.tostring(totalSetups), text_color = chart.fg_color, text_size = txSz)
 
 // ═══════════════════════════════════════════ MODULE 13 · ALERT ENGINE
 // Static alertconditions (pick from the TradingView "Add Alert" dropdown):
